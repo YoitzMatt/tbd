@@ -1,4 +1,4 @@
-# Durable TCP pub/sub broker (Go + Postgres)
+# Durable TCP pub/sub broker
 
 Topic-based publish/subscribe: publishers and subscribers talk only to the broker.
 The broker persists messages and subscription state in Postgres (at-least-once delivery comes next).
