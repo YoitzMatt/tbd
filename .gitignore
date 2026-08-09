@@ -1,0 +1,26 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.test
+/broker
+
+# Go
+vendor/
+
+# Env / local
+.env
+.env.*
+!.env.example
+.pgdata/
+.pgsocket/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Coverage
+coverage.out
+coverage.html
