@@ -35,6 +35,7 @@ type Store interface {
 	Publish(ctx context.Context, topic string, payload []byte) (msgID int64, err error)
 	EnsureSubscription(ctx context.Context, topic, group string) (Subscription, error)
 	LastAcked(ctx context.Context, subscriptionID int64) (int64, error)
+	ClaimUndelivered(ctx context.Context, subscriptionID int64) ([]Message, error)
 	Ack(ctx context.Context, subscriptionID, messageID int64) error
 	Close() error
 }

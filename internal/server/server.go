@@ -24,8 +24,19 @@ type Server struct {
 	ln     net.Listener
 	nextID atomic.Uint64
 
-	mu   sync.Mutex
-	conns map[uint64]net.Conn
+	mu    sync.Mutex
+	conns map[uint64]*clientConn
+}
+
+type clientConn struct {
+	net.Conn
+	writeMu sync.Mutex
+}
+
+func (c *clientConn) writeFrame(frame protocol.Frame) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return protocol.Encode(c.Conn, frame)
 }
 
 func New(addr string, broker *pubsub.Broker, log *slog.Logger) *Server {
@@ -36,7 +47,7 @@ func New(addr string, broker *pubsub.Broker, log *slog.Logger) *Server {
 		addr:   addr,
 		broker: broker,
 		log:    log,
-		conns:  make(map[uint64]net.Conn),
+		conns:  make(map[uint64]*clientConn),
 	}
 }
 
@@ -45,6 +56,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("server: listen: %w", err)
 	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve accepts connections from ln until ctx is canceled or the listener fails.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.ln = ln
 	s.log.Info("listening", "addr", ln.Addr().String())
 
@@ -54,20 +70,21 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}()
 
 	for {
-		conn, err := ln.Accept()
+		rawConn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return fmt.Errorf("server: accept: %w", err)
 		}
+		conn := &clientConn{Conn: rawConn}
 		id := s.nextID.Add(1)
 		s.track(id, conn)
 		go s.handle(ctx, id, conn)
 	}
 }
 
-func (s *Server) track(id uint64, c net.Conn) {
+func (s *Server) track(id uint64, c *clientConn) {
 	s.mu.Lock()
 	s.conns[id] = c
 	s.mu.Unlock()
@@ -79,7 +96,7 @@ func (s *Server) untrack(id uint64) {
 	s.mu.Unlock()
 }
 
-func (s *Server) handle(ctx context.Context, id uint64, conn net.Conn) {
+func (s *Server) handle(ctx context.Context, id uint64, conn *clientConn) {
 	defer func() {
 		s.broker.Unsubscribe(id)
 		s.untrack(id)
@@ -105,10 +122,10 @@ func (s *Server) handle(ctx context.Context, id uint64, conn net.Conn) {
 	}
 }
 
-func (s *Server) dispatch(ctx context.Context, id uint64, conn net.Conn, frame protocol.Frame) error {
+func (s *Server) dispatch(ctx context.Context, id uint64, conn *clientConn, frame protocol.Frame) error {
 	switch frame.Type {
 	case protocol.TypePing:
-		return protocol.Encode(conn, protocol.Frame{Type: protocol.TypePong})
+		return conn.writeFrame(protocol.Frame{Type: protocol.TypePong})
 
 	case protocol.TypePublish:
 		topic, body, err := protocol.DecodePublish(frame.Payload)
@@ -119,7 +136,7 @@ func (s *Server) dispatch(ctx context.Context, id uint64, conn net.Conn, frame p
 		if err != nil {
 			return err
 		}
-		return protocol.Encode(conn, protocol.Frame{
+		return conn.writeFrame(protocol.Frame{
 			Type:    protocol.TypePubOK,
 			Payload: protocol.EncodePubOK(uint64(msgID)),
 		})
@@ -129,14 +146,28 @@ func (s *Server) dispatch(ctx context.Context, id uint64, conn net.Conn, frame p
 		if err != nil {
 			return err
 		}
-		if _, err := s.broker.Subscribe(ctx, id, topic, group); err != nil {
+		deliver := func(message store.Message, topic string) error {
+			err := conn.writeFrame(protocol.Frame{
+				Type:    protocol.TypeMsg,
+				Payload: protocol.EncodeMsg(uint64(message.ID), topic, message.Payload),
+			})
+			if err != nil {
+				_ = conn.Close()
+			}
 			return err
 		}
-		return protocol.Encode(conn, protocol.Frame{Type: protocol.TypeOK})
+		if _, err := s.broker.Subscribe(ctx, id, topic, group, deliver); err != nil {
+			return err
+		}
+		if err := conn.writeFrame(protocol.Frame{Type: protocol.TypeOK}); err != nil {
+			s.broker.Unsubscribe(id)
+			return err
+		}
+		return s.broker.Activate(ctx, id)
 
 	case protocol.TypeUnsub:
 		s.broker.Unsubscribe(id)
-		return protocol.Encode(conn, protocol.Frame{Type: protocol.TypeOK})
+		return conn.writeFrame(protocol.Frame{Type: protocol.TypeOK})
 
 	case protocol.TypeAck:
 		msgID, err := protocol.DecodeAck(frame.Payload)
@@ -149,15 +180,15 @@ func (s *Server) dispatch(ctx context.Context, id uint64, conn net.Conn, frame p
 			}
 			return err
 		}
-		return protocol.Encode(conn, protocol.Frame{Type: protocol.TypeOK})
+		return conn.writeFrame(protocol.Frame{Type: protocol.TypeOK})
 
 	default:
 		return fmt.Errorf("unsupported type %s", frame.Type)
 	}
 }
 
-func writeErr(conn net.Conn, code uint16, msg string) error {
-	return protocol.Encode(conn, protocol.Frame{
+func writeErr(conn *clientConn, code uint16, msg string) error {
+	return conn.writeFrame(protocol.Frame{
 		Type:    protocol.TypeErr,
 		Payload: protocol.EncodeErr(code, msg),
 	})

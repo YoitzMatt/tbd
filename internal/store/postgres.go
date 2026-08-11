@@ -92,6 +92,39 @@ func (p *Postgres) LastAcked(ctx context.Context, subscriptionID int64) (int64, 
 	return id, err
 }
 
+func (p *Postgres) ClaimUndelivered(ctx context.Context, subscriptionID int64) ([]Message, error) {
+	const q = `
+		SELECT m.id, m.topic_id, m.payload, m.created_at
+		FROM messages m
+		JOIN subscriptions s ON s.topic_id = m.topic_id
+		JOIN subscription_offsets o ON o.subscription_id = s.id
+		LEFT JOIN deliveries d
+			ON d.subscription_id = s.id AND d.message_id = m.id
+		WHERE s.id = $1
+			AND m.id > o.last_acked_id
+			AND (d.message_id IS NULL OR d.leased_until <= now())
+		ORDER BY m.id`
+
+	rows, err := p.pool.Query(ctx, q, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []Message
+	for rows.Next() {
+		var message Message
+		if err := rows.Scan(&message.ID, &message.TopicID, &message.Payload, &message.CreatedAt); err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
 func (p *Postgres) Ack(ctx context.Context, subscriptionID, messageID int64) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
